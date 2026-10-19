@@ -1,0 +1,489 @@
+import QtQuick
+import Quickshell.Io
+import "Model.js" as Model
+
+// Samples CPU, memory, and GPU telemetry straight out of /proc and /sys.
+//
+// The only subprocess this service ever starts is `hw-probe`, once, to find
+// out which sysfs files this machine exposes (an NVIDIA card is the exception —
+// it has no sysfs telemetry, so it gets polled through nvidia-smi). Everything
+// else is a blocking read of a virtual file measured in microseconds, which is
+// why a bar widget can afford to do it on a two-second timer inside the shell
+// process instead of forking a script the way a Waybar module would.
+//
+// One instance exists per monitor, since the bar mounts a widget per screen.
+// The reads are cheap enough that this is not worth coordinating.
+Item {
+  id: root
+
+  property var settings: ({})
+
+  // Set false on a screen this widget is not drawn on: the timers stop and the
+  // probe never runs, so a hidden instance costs nothing.
+  property bool active: true
+
+  // Resolved from this file's own location rather than spelled out, so a fork
+  // that renames the plugin id does not silently lose the helper.
+  readonly property string pluginDir: {
+    var dir = String(Qt.resolvedUrl("."))
+    if (dir.indexOf("file://") === 0) dir = dir.substring(7)
+    return dir.replace(/\/$/, "")
+  }
+  readonly property string probePath: pluginDir + "/hw-probe"
+
+  readonly property int intervalSec: intSetting("refreshIntervalSec", 2, 1, 60)
+
+  // User-supplied fan RPM source overriding the probed hwmon input when it
+  // reports a positive value. Set via config/panel for firmware that reports
+  // a stuck 0 (HP 250 G9 / kernel bug 221149 — see README "Fan override").
+  readonly property string fanOverridePath: {
+    var path = String(setting("fanOverridePath", "")).trim()
+    return path === "" ? "" : path
+  }
+
+  // ------------------------------------------------------------- discovery
+
+  property var probe: Model.parseProbe("")
+  readonly property var cpuInfo: probe.cpu
+  readonly property var gpuInfo: Model.pickGpu(probe.gpus, setting("gpu", "auto"))
+  readonly property bool hasGpu: gpuInfo !== null
+  readonly property bool gpuIsNvidia: hasGpu && String(gpuInfo.kind) === "nvidia"
+
+  readonly property var fanInfo: probe.fan
+  readonly property bool hasFan: fanInfo !== null && fanInfo !== undefined
+  readonly property bool hasTempSensor: cpuTempFile.path !== ""
+  readonly property bool hasFanSensor: (fanFile.path !== ""
+    && fanInfo.path !== undefined && fanInfo.path !== null && fanInfo.path !== "")
+    || fanOverrideFile.path !== ""
+
+  // -------------------------------------------------------------- readings
+  //
+  // -1 means "this machine does not report it" or "not sampled yet". Every
+  // formatter in Model.js renders that as a dash, so a missing sensor degrades
+  // to a gap in the readout instead of a zero that looks like real data.
+
+  property real cpuPercent: -1
+  property real cpuTempC: -1
+  property real cpuMhz: -1
+  property var load: null
+
+  // System fan RPM, from the EC-backed fan input hw-probe located. -1 on
+  // machines whose fan is not readable, the live value otherwise.
+  property real fanRpm: -1
+
+  property var memory: null
+  readonly property real memPercent: memory ? memory.percent : -1
+
+  // Rolling history of the last 60 seconds, sampled once a second by a
+  // lightweight pusher so the graphs glide instead of stepping between ticks.
+  // File reads still happen on intervalSec; history just duplicates the latest
+  // reading in between, so buffering costs nothing but an array push.
+  // CPU entries carry the {user, system, iowait} stack; memory entries carry
+  // the {apps, cache, buffers} buckets. Temperature/fan stay scalar.
+  property var cpuHistory: []
+  property var memHistory: []
+  property var tempHistory: []
+  property var fanHistory: []
+  readonly property int historyCap: 60
+  readonly property int historySeconds: historyCap
+
+  property real gpuPercent: -1
+  property real gpuTempC: -1
+  property real gpuWatts: -1
+  property real gpuRpm: -1
+  property real gpuMhz: -1
+  property real gpuVramUsedBytes: -1
+  property real gpuVramTotalBytes: -1
+  readonly property real gpuVramPercent: gpuVramTotalBytes > 0
+    ? Model.clamp(100 * gpuVramUsedBytes / gpuVramTotalBytes, 0, 100) : -1
+
+  // The process readouts behind the popup's Heaviest CPU and Heaviest Memory
+  // lists. processReport is replaced wholesale by the last completed proc-probe
+  // run; every consumer binds to it read-only.
+  property var processReport: Model.parseProcessReport("")
+  readonly property int processIntervalSec: intSetting("processProbeIntervalSec", 8, 3, 60)
+  readonly property string procProbePath: pluginDir + "/proc-probe"
+
+  // Cumulative jiffies from the previous tick. CPU usage is the ratio between
+  // two samples, so there is nothing to show until the second one lands.
+  property var _prevJiffies: null
+
+  function setting(name, fallback) {
+    var value = settings ? settings[name] : undefined
+    return value === undefined || value === null ? fallback : value
+  }
+
+  function intSetting(name, fallback, min, max) {
+    var n = parseInt(String(setting(name, fallback)), 10)
+    if (!isFinite(n)) n = fallback
+    return Math.max(min, Math.min(max, n))
+  }
+
+  // hwmon reports temperatures in millidegrees, but a handful of drivers
+  // report whole degrees. Anything under 200 is already in degrees.
+  function readTemp(view) {
+    var raw = Model.toNumber(view.text(), -1)
+    if (!isFinite(raw) || raw <= 0) return -1
+    return raw > 200 ? raw / 1000 : raw
+  }
+
+  function readNumber(view, divisor) {
+    var raw = Model.toNumber(view.text(), -1)
+    if (!isFinite(raw) || raw < 0) return -1
+    return divisor ? raw / divisor : raw
+  }
+
+  function refreshProbe() {
+    probeProcess.command = [probePath]
+    probeProcess.running = true
+  }
+
+  function pushHistory(cpuStack, memory) {
+    var cap = root.historyCap
+    var c = root.cpuHistory.slice()
+    if (cpuStack && isFinite(cpuStack.user) && cpuStack.user >= 0) {
+      c.push({ user: cpuStack.user, system: cpuStack.system, iowait: cpuStack.iowait })
+      if (c.length > cap) c.shift()
+    }
+    root.cpuHistory = c
+
+    var m = root.memHistory.slice()
+    if (memory && isFinite(memory.usedPct) && memory.usedPct >= 0) {
+      m.push({ apps: memory.usedPct, cache: memory.cachePct, buffer: memory.bufferPct })
+      if (m.length > cap) m.shift()
+    }
+    root.memHistory = m
+  }
+
+  // Like the load history, but for the sensor pair: temperature normalized onto
+  // the 20-90 °C scale and fan speed onto a 0-6000 rpm scale, so both draw in
+  // the same 0-100 slot as the load graphs.
+  function pushSensorHistory(tempC, fanRpm) {
+    var cap = root.historyCap
+    var t = root.tempHistory.slice()
+    if (isFinite(tempC) && tempC >= 0) {
+      t.push(Model.clamp((tempC - 20) / 70 * 100, 0, 100))
+      if (t.length > cap) t.shift()
+    }
+    root.tempHistory = t
+
+    var f = root.fanHistory.slice()
+    // >= 0 so a stopped-but-readable fan (0 rpm, rendered "idle") still
+    // graphs as a flat baseline; -1 (no sensor) is never pushed.
+    if (isFinite(fanRpm) && fanRpm >= 0) {
+      f.push(Model.clamp(fanRpm / 6000 * 100, 0, 100))
+      if (f.length > cap) f.shift()
+    }
+    root.fanHistory = f
+  }
+
+  function sample() {
+    statFile.reload()
+    var jiffies = Model.parseCpuJiffies(statFile.text())
+    var stack = null
+    if (jiffies) {
+      stack = Model.cpuStack(_prevJiffies, jiffies)
+      if (stack) cpuPercent = stack.busy
+      _prevJiffies = jiffies
+    }
+
+    memFile.reload()
+    var parsed = Model.parseMemory(memFile.text())
+    if (parsed) memory = parsed
+
+    root.pushHistory(stack, parsed)
+
+    cpuinfoFile.reload()
+    var mhz = Model.averageMhz(cpuinfoFile.text())
+    cpuMhz = mhz > 0 ? mhz : -1
+
+    loadFile.reload()
+    load = Model.parseLoadAverage(loadFile.text())
+
+    if (cpuTempFile.path !== "") {
+      cpuTempFile.reload()
+      cpuTempC = readTemp(cpuTempFile)
+    }
+
+    if (fanOverrideFile.path !== "") {
+      fanOverrideFile.reload()
+      var overrideRpm = readNumber(fanOverrideFile, 0)
+      var overrideText = String(fanOverrideFile.text()).trim()
+      // -1 means unreadable/garbage, and empty means the publisher is absent
+      // (a missing file reads as "") — both fall back. 0 is a real reading
+      // (fan off), so it overrides and renders "idle" honestly.
+      if (overrideRpm >= 0 && overrideText !== "") {
+        fanRpm = overrideRpm
+      } else {
+        fanFile.reload()
+        fanRpm = readNumber(fanFile, 0)
+      }
+    } else if (fanFile.path !== "") {
+      fanFile.reload()
+      fanRpm = readNumber(fanFile, 0)
+    }
+
+    root.pushSensorHistory(cpuTempC, fanRpm)
+
+    if (gpuIsNvidia) {
+      sampleNvidia()
+      return
+    }
+
+    if (gpuBusyFile.path !== "") {
+      gpuBusyFile.reload()
+      gpuPercent = readNumber(gpuBusyFile, 0)
+    }
+    if (gpuTempFile.path !== "") {
+      gpuTempFile.reload()
+      gpuTempC = readTemp(gpuTempFile)
+    }
+    if (gpuPowerFile.path !== "") {
+      gpuPowerFile.reload()
+      gpuWatts = readNumber(gpuPowerFile, 1000000)
+    }
+    if (gpuFanFile.path !== "") {
+      gpuFanFile.reload()
+      gpuRpm = readNumber(gpuFanFile, 0)
+    }
+    if (gpuClockFile.path !== "") {
+      gpuClockFile.reload()
+      gpuMhz = readNumber(gpuClockFile, 1000000)
+    }
+    if (gpuVramUsedFile.path !== "") {
+      gpuVramUsedFile.reload()
+      gpuVramUsedBytes = readNumber(gpuVramUsedFile, 0)
+    }
+    if (gpuVramTotalFile.path !== "") {
+      gpuVramTotalFile.reload()
+      gpuVramTotalBytes = readNumber(gpuVramTotalFile, 0)
+    }
+  }
+
+  function sampleNvidia() {
+    if (nvidiaProcess.running) return
+    // fan.speed is deliberately not queried: nvidia-smi reports it as a
+    // percent, not RPM, so it cannot feed the RPM graphs or thresholds.
+    nvidiaProcess.command = ["nvidia-smi",
+                             "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw,clocks.current.graphics",
+                             "--format=csv,noheader,nounits",
+                             "--id=" + String(gpuInfo.index !== undefined ? gpuInfo.index : 0)]
+    nvidiaProcess.running = true
+  }
+
+  function applyNvidia(raw) {
+    var sample = Model.parseNvidia(raw)
+    if (!sample) return
+    gpuPercent = sample.busy
+    gpuTempC = sample.tempC
+    gpuWatts = sample.watts
+    gpuVramUsedBytes = sample.vramUsedBytes
+    gpuVramTotalBytes = sample.vramTotalBytes
+    gpuMhz = sample.mhz
+  }
+
+  // ----------------------------------------------------------------- files
+  //
+  // blockAllReads makes reload() synchronous: without it text() returns the
+  // previous tick's contents and every readout lags a full interval. These are
+  // kernel-generated files of a few KB, so a blocking read never stalls the UI.
+
+  FileView { id: statFile; path: "/proc/stat"; blockAllReads: true; printErrors: false }
+  FileView { id: memFile; path: "/proc/meminfo"; blockAllReads: true; printErrors: false }
+  FileView { id: cpuinfoFile; path: "/proc/cpuinfo"; blockAllReads: true; printErrors: false }
+  FileView { id: loadFile; path: "/proc/loadavg"; blockAllReads: true; printErrors: false }
+
+  FileView {
+    id: cpuTempFile
+    path: root.cpuInfo && root.cpuInfo.tempPath ? String(root.cpuInfo.tempPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+
+  FileView {
+    id: fanFile
+    path: root.hasFan ? String(root.fanInfo.path) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+
+  // Optional user-supplied fan RPM source (plain integer, one line). When it
+  // returns a positive number it overrides the probed hwmon fan input — for
+  // machines whose firmware lies about fan speed (e.g. HP 250 G9, where the
+  // WMI fan query is zeroed and hp-wmi fan*_input permanently reads 0;
+  // kernel bug 221149) an external root helper can publish the real tach
+  // here (see README "Fan override").
+  FileView {
+    id: fanOverrideFile
+    path: root.fanOverridePath
+    blockAllReads: true
+    printErrors: false
+  }
+
+  // A GPU sensor the card does not expose leaves its path empty, and sample()
+  // skips it — the widget then renders a dash rather than a fake zero.
+  FileView {
+    id: gpuBusyFile
+    path: root.hasGpu && root.gpuInfo.busyPath ? String(root.gpuInfo.busyPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+  FileView {
+    id: gpuTempFile
+    path: root.hasGpu && root.gpuInfo.tempPath ? String(root.gpuInfo.tempPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+  FileView {
+    id: gpuPowerFile
+    path: root.hasGpu && root.gpuInfo.powerPath ? String(root.gpuInfo.powerPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+  FileView {
+    id: gpuFanFile
+    path: root.hasGpu && root.gpuInfo.fanPath ? String(root.gpuInfo.fanPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+  FileView {
+    id: gpuClockFile
+    path: root.hasGpu && root.gpuInfo.clockPath ? String(root.gpuInfo.clockPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+  FileView {
+    id: gpuVramUsedFile
+    path: root.hasGpu && root.gpuInfo.vramUsedPath ? String(root.gpuInfo.vramUsedPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+  FileView {
+    id: gpuVramTotalFile
+    path: root.hasGpu && root.gpuInfo.vramTotalPath ? String(root.gpuInfo.vramTotalPath) : ""
+    blockAllReads: true
+    printErrors: false
+  }
+
+  // ------------------------------------------------------------- processes
+
+  Process {
+    id: probeProcess
+    stdout: StdioCollector {
+      id: probeOut
+      waitForEnd: true
+      onStreamFinished: {
+        root.probe = Model.parseProbe(text)
+        // Sensor paths only become known here, so take the first real sample
+        // once they land instead of waiting out a whole interval.
+        root.sample()
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  Process {
+    id: nvidiaProcess
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyNvidia(text) }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // The only place this plugin deliberately forks. proc-probe is a few
+  // hundred /proc directory reads a shell script does in about a second;
+  // doing that in-process on a timer would freeze the shell. Its report is
+  // on stdout, so the collector waits for the whole run and the service
+  // replaces processReport atomically when it lands.
+  Process {
+    id: procProbe
+    stdout: StdioCollector {
+      id: procProbeOut
+      waitForEnd: true
+      onStreamFinished: root.processReport = Model.parseProcessReport(text)
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // A confirmed destructive action, requested from the panel only after an
+  // explicit in-panel Yes. The panel gates it to processes owned by the
+  // desktop user and refuses pid <= 1 here as a second line of defence.
+  Process {
+    id: killProc
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  function refreshProcesses() {
+    if (!active || procProbe.running) return
+    // No HW_TOP_N override: the probe over-fetches 15 rows and the panel caps
+    // to topProcessCount (max 5), so lowering the cap costs nothing.
+    procProbe.command = [root.procProbePath]
+    procProbe.running = true
+  }
+
+  // `signal` is "term" (the graceful quit) or "kill" (SIGKILL). Only the
+  // panel's confirmed actions reach this point; nothing here inspects the pid.
+  function killProcess(pid, signal) {
+    if (!isFinite(pid) || pid <= 1) return
+    var sig = signal === "kill" ? "KILL" : "TERM"
+    killProc.command = ["kill", "-" + sig, String(pid)]
+    killProc.running = true
+  }
+
+  Timer {
+    id: procProbeTimer
+    interval: root.processIntervalSec * 1000
+    running: root.active
+    repeat: true
+    onTriggered: root.refreshProcesses()
+  }
+
+  // -------------------------------------------------------------- lifetime
+
+  Timer {
+    interval: root.intervalSec * 1000
+    running: root.active
+    repeat: true
+    onTriggered: root.sample()
+  }
+
+  // CPU usage needs two samples. Take the second one shortly after startup so
+  // the widget shows a real number immediately rather than a dash.
+  Timer {
+    interval: 350
+    running: root.active
+    repeat: false
+    onTriggered: root.sample()
+  }
+
+  // 1s history pusher: appends the latest readings from every history buffer
+  // between full samples, keeping all four graphs at the same once-a-second
+  // cadence and 60 samples deep. File reads still happen on intervalSec; the
+  // in-between ticks duplicate the latest reading so the graphs glide.
+  Timer {
+    interval: 1000
+    running: root.active
+    repeat: true
+    onTriggered: {
+      function dup(arr) {
+        var out = arr.slice()
+        if (out.length > 0) out.push(out[out.length - 1])
+        if (out.length > root.historyCap) out.shift()
+        return out
+      }
+      root.cpuHistory = dup(root.cpuHistory)
+      root.memHistory = dup(root.memHistory)
+      root.tempHistory = dup(root.tempHistory)
+      root.fanHistory = dup(root.fanHistory)
+    }
+  }
+
+  function start() {
+    if (!active || probeProcess.running) return
+    sample()
+    refreshProbe()
+    refreshProcesses()
+  }
+
+  onActiveChanged: if (active) start()
+  Component.onCompleted: start()
+}

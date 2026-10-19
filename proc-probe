@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# proc-probe — a periodic survey of the highest CPU and memory consumers.
+#
+# The activity-monitor plugin reads /proc directly for its telemetry, but
+# process accounting is not one file — it is a few hundred directories' worth —
+# so that
+# part hands off to this single short-running script instead. Two snapshots of
+# /proc/<pid>/stat are taken a second apart and the delta is normalized against
+# the whole-machine tick count, which is how top computes a percentage that is
+# comparable across machines.
+#
+# Emits a tab-separated report on stdout. Parsing lives in Model.js.
+#
+#   meta\t<unix-ts>\t<ncpus>\t<active-pid>\t<owner-uid>
+#   cpu\t<pid>\t<comm>\t<cpu%>\t<rssKb>\t<uid>\t<args>
+#   mem\t[...]
+#
+# Env knobs (all optional):
+#   HW_TOP_N         how many rows in the cpu / mem lists       (default 15)
+#                    Internal over-fetch: the panel caps to topProcessCount
+#                    (max 5), so this stays above any panel cap on purpose.
+
+export LC_ALL=C
+set -u
+
+TOP_N=${HW_TOP_N:-15}
+
+ME=$(id -u)
+
+# ------------------------------------------------------------------- probing
+#
+# One trip through /proc/[0-9]* using only bash builtins — no per-pid forks —
+# reading stat, status, cmdline, and environ with < > redirections.
+
+snapshot() {
+  local d pid line rest ppid utime stime comm st rss uid args
+  for d in /proc/[0-9]*; do
+    pid=${d##*/}
+    IFS= read -r line < "$d/stat" 2>/dev/null || continue
+    [[ $line == *') '* ]] || continue
+    # After the final ") " the fields restart at state: #12 is utime, #13 stime.
+    rest=${line##*) }
+    set -- $rest
+    ppid=$2
+    [[ $ppid == 2 ]] && continue      # children of kthreadd are kernel threads
+    utime=${12}
+    stime=${13}
+
+    comm=${line#*\(}
+    comm=${comm%\)*}
+    comm=${comm//$'\t'/" "}
+
+    { st="$(<"$d/status")"; } 2>/dev/null
+    rss=0
+    uid=-1
+    # The value lines are "VmRSS:\t 6572 kB" style; %% patterns on the raw string
+# misfire on the leading whitespace, so a regex is used for both numbers.
+if [[ $st =~ VmRSS:[[:space:]]*([0-9]+) ]]; then
+      rss=${BASH_REMATCH[1]}
+    fi
+    if [[ $st =~ Uid:[[:space:]]*([0-9]+) ]]; then
+      uid=${BASH_REMATCH[1]}
+    fi
+
+    # Residency in a field matters: an empty uid shifts every column after it
+    # when the reduce stage splits on tabs (read collapses empty fields).
+    [[ $uid =~ ^-?[0-9]+$ ]] || uid=-1
+
+    # cmdline is NUL separated and bash cannot store NUL in a variable, so the
+    # tokens are read one at a time into a space-joined string (builtins only).
+    { args=""
+      if [[ -r "$d/cmdline" ]]; then
+        while IFS= read -r -d '' tok; do
+          args+="$tok "
+          (( ${#args} > 80 )) && break
+        done < "$d/cmdline"
+      fi
+    } 2>/dev/null
+    args=${args//$'\t'/' '}
+    while [[ $args == *'  '* ]]; do args=${args//'  '/' '}; done
+    args=${args#" "}
+    args=${args%" "}
+    args=${args:0:80}
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$pid" "$comm" "$utime" "$stime" "$rss" "$uid" "$args"
+  done
+}
+
+totals() {
+  # "cpu" aggregate jiffies and the count of cores.
+  awk '
+    /^cpu /       { for (i = 2; i <= NF; i++) total += $i }
+    /^cpu[0-9]+/  { cores++ }
+    END           { print total, cores }
+  ' /proc/stat
+}
+
+# ------------------------------------------------------------- the two ticks
+
+t1=$(totals)
+s1=$(snapshot)
+sleep 1
+t2=$(totals)
+s2=$(snapshot)
+
+read -r TICKS1 _ <<< "$t1"
+read -r TICKS2 NCPUS <<< "$t2"
+TICKS_TOTAL=$(( (TICKS2 > TICKS1 ? TICKS2 : TICKS1) - TICKS1 ))
+(( TICKS_TOTAL > 0 )) || TICKS_TOTAL=1
+
+# The probe only ranks CPU and memory consumers — both lists are view-only,
+# with consent-gated kill actions offered by the panel. The meta line keeps
+# its fixed 5-field shape (ts, ncpus, active-pid, owner-uid) for parser
+# compatibility; active-pid is always 0 and unused.
+ACTIVE_PID=0
+
+# ------------------------------------------------------------------- reduce
+
+declare -A U2 S2 R2
+declare -a PIDS2
+while IFS=$'\t' read -ra f; do
+  [[ ${f[0]} =~ ^[0-9]+$ ]] || continue
+  [[ ${f[2]} =~ ^[0-9]+$ && ${f[3]} =~ ^[0-9]+$ ]] || continue
+  pid=${f[0]}
+  U2[$pid]=${f[2]}
+  S2[$pid]=${f[3]}
+  R2[$pid]=${f[4]:-0}
+  PIDS2+=("$pid")
+done <<< "$s2"
+
+# cpu% per pid plus the first snapshot's row data for lookups
+declare -A CPU COMM1 RSS1 UID1 ARGS1
+declare -a PIDS
+while IFS=$'\t' read -ra f; do
+  pid=${f[0]}
+  [[ $pid =~ ^[0-9]+$ ]] || continue
+  [[ ${f[2]} =~ ^[0-9]+$ && ${f[3]} =~ ^[0-9]+$ ]] || continue
+  [[ -n ${U2[$pid]+x} ]] || continue
+
+  delta=$(( U2[$pid] + S2[$pid] - f[2] - f[3] ))
+  (( delta >= 0 )) || delta=0
+  CPU[$pid]=$(( delta * NCPUS * 100 / TICKS_TOTAL ))
+
+  COMM1[$pid]=${f[1]}
+  RSS1[$pid]=${f[4]:-0}
+  UID1[$pid]=${f[5]:--1}
+  ARGS1[$pid]=${f[*]:6}
+  PIDS+=("$pid")
+done <<< "$s1"
+
+row() {
+  local tag=$1 pid=$2
+  if [[ ! -v COMM1[$pid] ]]; then printf 'row: no COMM1 for pid %s\n' "$pid" >&2; fi
+  printf '%s\t%s\t%s\t%.1f\t%s\t%s\t%s\n' \
+    "$tag" "$pid" "${COMM1[$pid]:-?}" "${CPU[$pid]:--1}" \
+    "${RSS1[$pid]:-0}" "${UID1[$pid]:--1}" "${ARGS1[$pid]:-}"
+}
+
+printf 'meta\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$NCPUS" "$ACTIVE_PID" "$ME"
+
+# top cpu — any user, a root process can genuinely hog a core
+{
+  for pid in "${PIDS[@]}"; do
+    printf '%s\t%s\n' "${CPU[$pid]}" "$pid"
+  done
+} | sort -nr -t $'\t' -k1,1 | head -n "$TOP_N" | while IFS=$'\t' read -r _ pid; do
+  row cpu "$pid"
+done
+
+# top memory
+{
+  for pid in "${PIDS[@]}"; do
+    printf '%s\t%s\n' "${RSS1[$pid]}" "$pid"
+  done
+} | sort -nr -t $'\t' -k1,1 | head -n "$TOP_N" | while IFS=$'\t' read -r _ pid; do
+  row mem "$pid"
+done
