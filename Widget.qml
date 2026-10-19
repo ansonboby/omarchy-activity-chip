@@ -587,6 +587,14 @@ Panel {
     return chipStats.indexOf(want) !== -1 || want === "auto" ? want : "auto"
   }
 
+  function chipTempText(celsius) {
+    // Chip cell: degrees only — "°C"-suffixed text is too wide for the 26px
+    // column. severity color + the popup carry the unit context.
+    var figure = Model.tempNumber(celsius, fahrenheit)
+    if (figure === "–") return figure
+    return figure + "°"
+  }
+
   function chipEnabled(key) {
     if (key === "cpu") return showCpu
     if (key === "ram") return showRam
@@ -651,7 +659,7 @@ Panel {
         label: "TEMP",
         icon: tempIcon,
         iconRotation: tempIconRotation,
-        value: tempText(hw.cpuTempC),
+        value: chipTempText(hw.cpuTempC),
         pad: "",
         slotted: false,
         temp: "",
@@ -663,12 +671,13 @@ Panel {
     }
 
     if (key === "ram") {
+      // Chip cell: percent only — "5.3/15G" cannot fit the 26px column.
       return {
         key: "ram",
         label: "RAM",
         icon: ramIcon,
         iconRotation: ramIconRotation,
-        value: ramText(),
+        value: percentText(hw.memPercent),
         pad: "",
         slotted: false,
         temp: "",
@@ -705,7 +714,7 @@ Panel {
         label: "GPU°",
         icon: gpuTempIcon,
         iconRotation: gpuTempIconRotation,
-        value: tempText(hw.gpuTempC),
+        value: chipTempText(hw.gpuTempC),
         pad: "",
         slotted: false,
         temp: "",
@@ -861,7 +870,9 @@ Panel {
           ? glyphMetrics.tightBoundingRect.height
           : glyphMetrics.tightBoundingRect.width
 
-        visible: !root.labelled
+        // Chip cells are figure-only: the 26px column cannot fit glyph and
+        // figure without clipping, and a lone "55°" is the cleanest read.
+        visible: !root.labelled && modelData.chip !== true
         width: visible ? Math.max(1, Math.ceil(inkWidth)) : 0
         height: root.contentHeight
 
@@ -893,7 +904,7 @@ Panel {
       }
 
       Gauge {
-        visible: root.showGauges && !root.labelled
+        visible: root.showGauges && !root.labelled && modelData.chip !== true
         height: root.contentHeight
         bodyWidth: root.gaugeWidth
         bodyHeight: root.gaugeHeight
